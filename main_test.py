@@ -18,8 +18,8 @@ MODEL_KEYS = [
     "openai-vit-b32",
     "openai-vit-b16",
     "openai-vit-l14",
-    #"google-siglip2-b32-256",
-    #"facebook-metaclip2-b16",
+    "google-siglip2-b32-256",
+    "facebook-metaclip2-b16",
 ]
 
 def visualize(hmap, image, out_path):
@@ -67,12 +67,14 @@ def run_forward_smoke_test() -> None:
         #try:
         model.load_model()
 
-        #model.print_model_info()
+        model.print_model_info()
+
+        #print(inspect.getsource(model.model.vision_model.head.forward))
+
 
         emap, _ = model.explain(image=image, text=text)
         visualize(emap, image, f"Images/Output/output_{model_key}.png")
 
-        # print(inspect.getsource(model.processor.__call__))
     
 
 

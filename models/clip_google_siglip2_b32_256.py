@@ -14,4 +14,5 @@ class GoogleSiglip2B32_256Clip(ClipModel):
             device=device,
             load_on_init=load_on_init,
         )
+        self.cls_token = False
 

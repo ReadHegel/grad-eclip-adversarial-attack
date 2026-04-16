@@ -168,7 +168,7 @@ class ClipModel(ABC):
     def _grad_eclip(
             self, c: torch.Tensor, q_out: torch.Tensor, k_out: torch.Tensor,
             v: torch.Tensor, att_output: torch.Tensor, patch_map_size: tuple,
-            withksim: bool = True
+            withksim: bool = True, cls_token: bool = True,
         ) -> torch.Tensor:
             """Compute Grad-ECLIP heatmap for scalar c (universal)."""
             grad = torch.autograd.grad(c, att_output, retain_graph=True, create_graph=True)[0]
@@ -176,15 +176,18 @@ class ClipModel(ABC):
 
             if withksim:
                 q_cls = q_out[:1, 0, :]
-                k_patch = k_out[1:, 0, :]
+                k_patch = k_out[:, 0, :]
                 q_cls = torch.nn.functional.normalize(q_cls, dim=-1)
                 k_patch = torch.nn.functional.normalize(k_patch, dim=-1)
                 cosine_qk = (q_cls * k_patch).sum(-1)
                 cosine_qk = (cosine_qk - cosine_qk.min()) / (cosine_qk.max() - cosine_qk.min() + 1e-8)
-                emap = torch.nn.functional.relu((grad_cls * v[1:, 0, :] * cosine_qk[:, None]).sum(-1))
+                emap = torch.nn.functional.relu((grad_cls * v[:, 0, :] * cosine_qk[:, None]).sum(-1))
             else:
-                emap = torch.nn.functional.relu((grad_cls * v[1:, 0, :]).sum(-1))
+                emap = torch.nn.functional.relu((grad_cls * v[:, 0, :]).sum(-1))
 
+            print(f"emap shape before reshape: {emap.shape}")
+            if cls_token:
+                emap = emap[1:]  # remove CLS token
             return emap.reshape(*patch_map_size)
 
     def _get_patch_size(self):
@@ -225,7 +228,7 @@ class ClipModel(ABC):
         dense_output = self.encode_dense(pixel_values)
 
         # 5. Get image embedding from CLS token
-        img_embedding = torch.nn.functional.normalize(dense_output.embeddings[:, 0, :], dim=-1)
+        img_embedding = torch.nn.functional.normalize(dense_output.embeddings, dim=-1)
 
         # 6. Compute cosine similarities
         cosines = (img_embedding @ text_embedding.T)[0]
@@ -234,7 +237,8 @@ class ClipModel(ABC):
         # 7. Compute Grad-ECLIP for each scalar
         emap_list = [
             self._grad_eclip(c, dense_output.q_out, dense_output.k_out, dense_output.v,
-                             dense_output.att_output, dense_output.patch_map_size, withksim=True)
+                             dense_output.att_output, dense_output.patch_map_size, withksim=True,
+                             cls_token=self.cls_token)
             for c in cosines
         ]
         emap = torch.stack(emap_list, dim=0).sum(0)
@@ -245,13 +249,15 @@ class ClipModel(ABC):
 
         return emap, dense_output.classic_output
 
-    def get_transform(self):
-        CLIP_DATA_STD = (0.26862954, 0.26130258, 0.27577711)
-        CLIP_DATA_MEAN = (0.48145466, 0.4578275, 0.40821073)
+    def _get_transform(self):
+        image_processor = getattr(self.processor, "image_processor", self.processor)
+
+        mean = tuple(float(x) for x in image_processor.image_mean)
+        std = tuple(float(x) for x in image_processor.image_std)
 
         return torchvision.transforms.Compose([
             torchvision.transforms.ToTensor(),
-            torchvision.transforms.Normalize(CLIP_DATA_MEAN, CLIP_DATA_STD),
+            torchvision.transforms.Normalize(mean, std),
         ]) 
 
     def proccess_keepsize(self, img, scale_factor=1.0):
@@ -264,7 +270,7 @@ class ClipModel(ABC):
 
         ResizeOp = torchvision.transforms.Resize((new_height, new_width), interpolation=torchvision.transforms.InterpolationMode.BICUBIC)
         img = ResizeOp(img).convert("RGB")
-        return self.get_transform()(img)
+        return self._get_transform()(img)
 
     def patch_and_embed_with_interpolation(self, pixel_values: torch.Tensor) -> torch.Tensor:
         # vision_width = model.config.vision_config.hidden_size
@@ -301,15 +307,27 @@ class ClipModel(ABC):
         return x + pos_embedding, (feah, feaw)
 
     def encode_dense(self, pixel_values: torch.Tensor) -> EncodeDenseOutput:
-        x, patch_map_size = self.patch_and_embed_with_interpolation(pixel_values)
+        # Potentially cound be deleted
+        # x, patch_map_size = self.patch_and_embed_with_interpolation(pixel_values)
 
-        x = self.model.vision_model.pre_layrnorm(x)
+        y = self.model.vision_model.embeddings(pixel_values, interpolate_pos_encoding=True)
+        patch_size = self._get_patch_size()
+        patch_map_size = (pixel_values.shape[-2] // patch_size, pixel_values.shape[-1] // patch_size)
+        print(f"y.shape: {y.shape}")
+        print(patch_map_size)
+        x = y
+
+        if hasattr(self.model.vision_model, "pre_layrnorm"):
+            x = self.model.vision_model.pre_layrnorm(x)
 
         x_in = x
         for module in self.model.vision_model.encoder.layers[:-1]:
             x_in = module(x_in, None)
 
-        classic_prediction = self.model.visual_projection(self.model.vision_model.post_layernorm(self.model.vision_model.encoder.layers[-1](x_in, None)[:,0,:]))
+        if hasattr(self.model, "visual_projection"):
+            classic_prediction = self.model.visual_projection(self.model.vision_model.post_layernorm(self.model.vision_model.encoder.layers[-1](x_in, None)[:,0,:]))
+        else:
+            classic_prediction = self.model.vision_model.head(self.model.vision_model.post_layernorm(self.model.vision_model.encoder.layers[-1](x_in, None)))
 
         x_in = x_in.permute(1, 0, 2)
 
@@ -339,23 +357,28 @@ class ClipModel(ABC):
 
         # x = x @ clipmodel.visual.proj HF
 
-        x = self.model.visual_projection(x)
+        if hasattr(self.model, "visual_projection"):
+            x = self.model.visual_projection(x)[:, 0, :]
+        else:
+            x = self.model.vision_model.head(x)
 
         ## ==== get lastv ==============
-
         qkv = torch.stack((q, k, v), dim=0)
         qkv = targetTR_2.self_attn.out_proj(qkv)
         q_out, k_out, v_out = qkv[0], qkv[1], qkv[2]
 
-        v_final = v_out + x_in
-        v_final = v_final + targetTR_2.mlp(targetTR_2.layer_norm2(v_final))
-        v_final = v_final.permute(1, 0, 2)
 
-        v_final = self.model.vision_model.post_layernorm(v_final)
+        # TODO czy my tego używamy
+        # v_final = v_out + x_in
+        # v_final = v_final + targetTR_2.mlp(targetTR_2.layer_norm2(v_final))
+        # v_final = v_final.permute(1, 0, 2)
 
-        v_final = self.model.visual_projection(v_final)
+        # v_final = self.model.vision_model.post_layernorm(v_final)
+
+        # v_final = self.model.visual_projection(v_final)
         ##############
 
+        print("embeddings shape:", x.shape)
         return EncodeDenseOutput(
             embeddings=x,
             q_out=q_out,

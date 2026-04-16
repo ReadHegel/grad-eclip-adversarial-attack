@@ -14,3 +14,4 @@ class OpenAIViTB16Clip(ClipModel):
             device=device,
             load_on_init=load_on_init,
         )
+        self.cls_token = True
