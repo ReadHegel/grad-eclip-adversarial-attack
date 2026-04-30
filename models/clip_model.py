@@ -305,6 +305,43 @@ class ClipModel(ABC):
         pos_embedding = torch.cat((tok_pos[None, ...], img_pos), dim=1)
 
         return x + pos_embedding, (feah, feaw)
+    
+    def grad_eclip_attention_layer(
+        self, targetLayer, x_in
+    ):
+        x_before_attn = targetLayer.layer_norm1(x_in)
+
+        q = targetLayer.self_attn.q_proj(x_before_attn)
+        k = targetLayer.self_attn.k_proj(x_before_attn)
+        v = targetLayer.self_attn.v_proj(x_before_attn)
+
+        attn_output, attn = ClipModel._attention_layer(q, k, v, 1) #vision_heads
+
+        x_after_attn = targetLayer.self_attn.out_proj(attn_output)
+
+        x = x_after_attn + x_in
+
+        # x_out = x + targetLayer.mlp(targetLayer.ln_2(x))
+        x_out = x + targetLayer.mlp(targetLayer.layer_norm2(x))
+
+        x = x_out.permute(1, 0, 2)  # LND -> NLD
+
+        ## ==== get lastv ==============
+        qkv = torch.stack((q, k, v), dim=0)
+        qkv = targetLayer.self_attn.out_proj(qkv)
+        q_out, k_out, v_out = qkv[0], qkv[1], qkv[2]
+
+
+        # TODO czy my tego używamy
+        # v_final = v_out + x_in
+        # v_final = v_final + targetTR_2.mlp(targetTR_2.layer_norm2(v_final))
+        # v_final = v_final.permute(1, 0, 2)
+
+        # v_final = self.model.vision_model.post_layernorm(v_final)
+
+        # v_final = self.model.visual_projection(v_final)
+        ##############
+        return x, q_out, k_out, v, attn_output
 
     def encode_dense(self, pixel_values: torch.Tensor) -> EncodeDenseOutput:
         # Potentially cound be deleted
@@ -333,50 +370,17 @@ class ClipModel(ABC):
 
         ##################
         # LastTR.attention
-        targetTR_2 = self.model.vision_model.encoder.layers[-1]
+        x, q_out, k_out, v, attn_output = self.grad_eclip_attention_layer(
+            self.model.vision_model.encoder.layers[-1], x_in
+        )
 
-        x_before_attn = targetTR_2.layer_norm1(x_in)
-
-        q = targetTR_2.self_attn.q_proj(x_before_attn)
-        k = targetTR_2.self_attn.k_proj(x_before_attn)
-        v = targetTR_2.self_attn.v_proj(x_before_attn)
-
-        attn_output, attn = ClipModel._attention_layer(q, k, v, 1) #vision_heads
-
-        x_after_attn = targetTR_2.self_attn.out_proj(attn_output)
-
-        x = x_after_attn + x_in
-
-        # x_out = x + targetTR.mlp(targetTR.ln_2(x))
-        x_out = x + targetTR_2.mlp(targetTR_2.layer_norm2(x))
-
-        x = x_out.permute(1, 0, 2)  # LND -> NLD
-
-        #x = clipmodel.visual.ln_post(x) HF
         x = self.model.vision_model.post_layernorm(x)
-
-        # x = x @ clipmodel.visual.proj HF
 
         if hasattr(self.model, "visual_projection"):
             x = self.model.visual_projection(x)[:, 0, :]
         else:
             x = self.model.vision_model.head(x)
 
-        ## ==== get lastv ==============
-        qkv = torch.stack((q, k, v), dim=0)
-        qkv = targetTR_2.self_attn.out_proj(qkv)
-        q_out, k_out, v_out = qkv[0], qkv[1], qkv[2]
-
-
-        # TODO czy my tego używamy
-        # v_final = v_out + x_in
-        # v_final = v_final + targetTR_2.mlp(targetTR_2.layer_norm2(v_final))
-        # v_final = v_final.permute(1, 0, 2)
-
-        # v_final = self.model.vision_model.post_layernorm(v_final)
-
-        # v_final = self.model.visual_projection(v_final)
-        ##############
 
         print("embeddings shape:", x.shape)
         return EncodeDenseOutput(

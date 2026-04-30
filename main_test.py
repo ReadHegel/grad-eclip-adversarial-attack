@@ -17,9 +17,9 @@ import cv2
 MODEL_KEYS = [
     "openai-vit-b32",
     "openai-vit-b16",
-    "openai-vit-l14",
-    "google-siglip2-b32-256",
-    "facebook-metaclip2-b16",
+    # "openai-vit-l14",
+    # "google-siglip2-b32-256",
+    # "facebook-metaclip2-b16",
 ]
 
 def visualize(hmap, image, out_path):
