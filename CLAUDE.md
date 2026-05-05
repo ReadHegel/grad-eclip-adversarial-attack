@@ -69,6 +69,71 @@ Adding a new model requires only a minimal subclass that sets `model_id` and `cl
 3. Optimization loop with Adam: minimize `explanation_MSE + embedding_preservation_loss`
 4. Visualize embedding trajectories in 3D
 
+## Running Jobs on the Entropy GPU Cluster (Slurm)
+
+**IMPORTANT**: `--partition` and `--qos` are mandatory for every job. Check your associations with:
+```bash
+entropy_account_info
+```
+
+### Quick interactive job (`srun`)
+
+```bash
+# Single command, 1 GPU, 10 minutes
+srun --partition=common --qos=1gpu1h --time=10 --gres=gpu:1 nvidia-smi -L
+
+# Specific node
+srun --nodelist=arnold --partition=common --qos=1gpu1h --time=20 --gres=gpu:1 nvidia-smi -L
+
+# Specific GPU type, save output to file
+srun --nodelist=arnold --partition=common --qos=1gpu1h --output=out.txt --time=1:00 --gres=gpu:titanv:1 nvidia-smi -L
+```
+
+### Batch job (`sbatch`)
+
+`--output` is mandatory in batch mode. Write a `job.sh`:
+
+```bash
+#!/bin/bash
+#
+#SBATCH --job-name=test_job
+#SBATCH --partition=common
+#SBATCH --qos=1gpu1d
+#SBATCH --gres=gpu:1
+#SBATCH --time=1-0
+#SBATCH --output=job_out.txt
+
+uv run python main_test.py
+```
+
+Then submit:
+```bash
+sbatch job.sh
+```
+
+### Time format
+
+| Format | Example | Meaning |
+|--------|---------|---------|
+| `<min>` | `30` | 30 minutes |
+| `<hr>:<min>:<sec>` | `1:30:00` | 1h 30m |
+| `<days>-<hr>` | `2-6` | 2 days 6 hours |
+| `<days>-<hr>:<min>:<sec>` | `1-12:30:00` | 1d 12h 30m |
+
+### PATH / environment variables
+
+Slurm copies env vars from the submission node — but `PATH` may differ on compute nodes. Use full paths or export explicitly:
+
+```bash
+# Option 1: full path
+/usr/local/cuda/bin/nvcc --version
+
+# Option 2: export in sbatch header
+#SBATCH --export=ALL,PATH="/usr/local/cuda/bin:${PATH}"
+```
+
+Do **not** change `--mem` without a specific reason — defaults are optimized for GPU node utilization.
+
 ### Key Implementation Notes
 
 - `encode_dense()` uses PyTorch forward hooks to capture intermediate tensors — hooks must be registered before the forward pass and removed after
