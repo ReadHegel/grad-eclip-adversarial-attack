@@ -32,6 +32,7 @@ class ClipModel(ABC):
         device: str | torch.device | None = None,
         torch_dtype: torch.dtype | None = None,
         load_on_init: bool = True,
+        num_heads: int = 1
     ) -> None:
         self.model_id = model_id
         self.torch_dtype = torch_dtype
@@ -39,6 +40,7 @@ class ClipModel(ABC):
 
         self.model: Any | None = None
         self.processor: Any | None = None
+        self.num_heads = num_heads
 
         if load_on_init:
             self.load_model()
@@ -311,7 +313,7 @@ class ClipModel(ABC):
         k = targetLayer.self_attn.k_proj(x_before_attn)
         v = targetLayer.self_attn.v_proj(x_before_attn)
 
-        attn_output, attn = ClipModel._attention_layer(q, k, v, 1) #vision_heads
+        attn_output, attn = ClipModel._attention_layer(q, k, v, self.num_heads) #vision_heads
 
         x_after_attn = targetLayer.self_attn.out_proj(attn_output)
 
