@@ -21,6 +21,8 @@ class EncodeDenseOutput(NamedTuple):
     att_output: torch.Tensor       # (seq_len, batch, hidden) - attention before residual
     patch_map_size: tuple          # (H, W) - spatial grid of patches
     classic_output: torch.Tensor   # (batch, seq_len, hidden) - final output without projection (for sanity checks)
+    q_raw: torch.Tensor            # (seq_len, batch, hidden) - raw Q from q_proj (before out_proj)
+    k_raw: torch.Tensor            # (seq_len, batch, hidden) - raw K from k_proj (before out_proj)
 
 
 class ClipModel(ABC):
@@ -339,7 +341,7 @@ class ClipModel(ABC):
 
         # v_final = self.model.visual_projection(v_final)
         ##############
-        return x, q_out, k_out, v, attn_output
+        return x, q_out, k_out, v, attn_output, q, k
 
     def encode_dense(self, pixel_values: torch.Tensor) -> EncodeDenseOutput:
         # Potentially cound be deleted
@@ -368,7 +370,7 @@ class ClipModel(ABC):
 
         ##################
         # LastTR.attention
-        x, q_out, k_out, v, attn_output = self.grad_eclip_attention_layer(
+        x, q_out, k_out, v, attn_output, q_raw, k_raw = self.grad_eclip_attention_layer(
             self.model.vision_model.encoder.layers[-1], x_in
         )
 
@@ -388,7 +390,9 @@ class ClipModel(ABC):
             v=v,
             att_output=attn_output,
             patch_map_size=patch_map_size,
-            classic_output=classic_prediction
+            classic_output=classic_prediction,
+            q_raw=q_raw,
+            k_raw=k_raw,
         )
 
     def ruin(self, img: Image.Image, text: str, target_explanation: torch.Tensor, DELTA = 0.03) -> Image.Image:
