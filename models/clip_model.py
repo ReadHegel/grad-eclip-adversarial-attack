@@ -5,7 +5,9 @@ from tkinter import Image
 from tkinter import Image
 from typing import Any, NamedTuple
 
+from numpy import typing
 import torchvision
+import tqdm
 from transformers import AutoModel, AutoProcessor
 
 import torch
@@ -118,21 +120,7 @@ class ClipModel(ABC):
             torch.cuda.empty_cache()
 
 # === GRAD-ECLIP IMPLEMENTATIONS ===
-    @abstractmethod
-    def encode_dense(self, pixel_values: torch.Tensor) -> EncodeDenseOutput:
-        """
-        Forward pass through vision encoder with decomposed last attention layer.
-        
-        Each subclass implements this with knowledge of its architecture
-        (ViT-B/16 structure differs from SigLIP which differs from MetaCLIP, etc).
-        
-        Args:
-            pixel_values: (batch, 3, H, W) preprocessed image tensor
-            
-        Returns:
-            EncodeDenseOutput with q,k,v,attention from last layer needed for Grad-ECLIP.
-        """
-        pass
+
 
     # Exact copy from notebook
     # Used to compute att for explained layer 
@@ -224,6 +212,9 @@ class ClipModel(ABC):
         ).pooler_output
         text_embedding = torch.nn.functional.normalize(text_features, dim=-1)
 
+        return self.generate_hm(pixel_values, text_embedding)
+
+    def generate_hm(self, pixel_values, text_embedding):
         # 4. Encode image (each subclass implements this differently)
         dense_output = self.encode_dense(pixel_values)
 
@@ -260,7 +251,8 @@ class ClipModel(ABC):
             torchvision.transforms.Normalize(mean, std),
         ]) 
 
-    def proccess_keepsize(self, img, scale_factor=1.0):
+
+    def _proccess_keepsize(self, img, scale_factor=1.0):
         w, h = img.size
         patch_height = patch_width = self._get_patch_size()
 
@@ -270,6 +262,10 @@ class ClipModel(ABC):
 
         ResizeOp = torchvision.transforms.Resize((new_height, new_width), interpolation=torchvision.transforms.InterpolationMode.BICUBIC)
         img = ResizeOp(img).convert("RGB")
+        return img
+
+    def proccess_keepsize(self, img, scale_factor=1.0):
+        img = self._proccess_keepsize(img, scale_factor)
         return self._get_transform()(img)
 
     def patch_and_embed_with_interpolation(self, pixel_values: torch.Tensor) -> torch.Tensor:
@@ -392,3 +388,69 @@ class ClipModel(ABC):
             patch_map_size=patch_map_size,
             classic_output=classic_prediction
         )
+
+    def ruin(self, img: Image.Image, text: str, target_explanation: torch.Tensor, DELTA = 0.03) -> Image.Image:
+
+        transform = self._get_transform()
+        img = self._proccess_keepsize(img)
+        img_tensor = transform.transforms[0](img).to(self.device).unsqueeze(0).detach()
+        # img_tensor = imgprocess_size_transform(img).to(device).unsqueeze(0).detach()
+
+        target_resized: typing.Optional[torch.Tensor] = None 
+
+        # feed forward text
+        inputs = self.processor(text=[text], return_tensors="pt").to(self.device)
+        text_embedding = self.model.get_text_features(**inputs).pooler_output.detach()
+
+        change_tensor = torch.zeros_like(img_tensor, requires_grad=True).to(self.device)
+
+        optimizer = torch.optim.Adam([change_tensor], lr=0.1)
+
+        losses1: list[float] = []
+        losses2: list[float] = []
+
+        original_embedding: None | torch.Tensor = None
+        embeddings: list[torch.Tensor] = []
+
+        for i in tqdm.tqdm(range(50)):
+
+            image_changed = img_tensor + (torch.nn.functional.sigmoid(change_tensor) * 2 - 1) * DELTA
+            image_changed_processed = transform.transforms[1](image_changed)
+
+            hm, embedding = self.generate_hm(image_changed_processed, text_embedding)
+            
+            if target_resized is None:
+                try:
+                    hm_resize = torchvision.transforms.Resize(hm.shape[-2:])
+                    target_resized = (hm_resize(target_explanation.to(self.device).unsqueeze(0)))[0]
+                except RuntimeError:
+                    hm_resize = torchvision.transforms.Resize(hm.shape[-2:], interpolation=torchvision.transforms.InterpolationMode.NEAREST)
+                    target_resized = (hm_resize(target_explanation.to(self.device).unsqueeze(0)))[0]
+
+            assert target_resized.shape == hm.shape
+
+            loss1 = torch.sum((hm - target_resized)**2)
+
+            if original_embedding is None:
+                original_embedding = embedding.detach()
+                loss2 = torch.tensor(0).to(self.device)
+            else:
+                loss2 = torch.sum((embedding - original_embedding)**2)
+
+            embeddings.append(embedding.detach())
+
+            loss = loss1 + loss2
+
+            losses1.append(loss1.item())
+            losses2.append(loss2.item())
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+        image_changed = img_tensor + (torch.nn.functional.sigmoid(change_tensor) * 2 - 1) * DELTA
+        image_changed = torch.clamp(image_changed, 0, 1)
+
+        result_img = torchvision.transforms.ToPILImage()(image_changed[0])
+
+        return result_img, losses1, losses2, embeddings

@@ -17,9 +17,9 @@ import cv2
 MODEL_KEYS = [
     "openai-vit-b32",
     "openai-vit-b16",
-    # "openai-vit-l14",
-    # "google-siglip2-b32-256",
-    # "facebook-metaclip2-b16",
+    "openai-vit-l14",
+    "google-siglip2-b32-256",
+    "facebook-metaclip2-b16",
 ]
 
 def visualize(hmap, image, out_path):
@@ -62,31 +62,25 @@ def run_forward_smoke_test() -> None:
 
     for model_key in MODEL_KEYS:
         print(f"\n=== Testing {model_key} ===")
-        model = build_clip_model(model_key, device="cpu", load_on_init=False)
+        model = build_clip_model(model_key, device=device, load_on_init=False)
 
-        #try:
         model.load_model()
+        # model.print_model_info()
 
-        model.print_model_info()
+        for model_key_prim in MODEL_KEYS:
+            ruined_img = Image.open(f"Images/Output/ruined_{model_key_prim}.png").convert("RGB")
 
-        #print(inspect.getsource(model.model.vision_model.head.forward))
+            emap, _ = model.explain(image=ruined_img, text=text)
+            visualize(emap, ruined_img, f"Images/Output/CrossEmap/emap_expl_with_{model_key}_{model_key_prim}.png")
 
+        # target_img = Image.open("Images/targets/smiley.gif").convert("RGBA")  
+        # target_tensor = 1 - torchvision.transforms.ToTensor()(target_img)[0, :, :]
 
-        emap, _ = model.explain(image=image, text=text)
-        visualize(emap, image, f"Images/Output/output_{model_key}.png")
+        # ruined_img, _, _, _ = model.ruin(image, text, target_tensor)
+        # ruined_img.save(f"Images/Output/ruined_{model_key}.png")
 
-    
-
-
-        if use_cuda:
-            model.move_to_gpu(0)
-
-        outputs = model.forward(image=image, text=text)
-        output_keys = list(outputs.keys()) if hasattr(outputs, "keys") else []
-        print(f"Forward OK. Output keys: {output_keys}")
-
-        # except Exception as exc:
-        #     print(f"Forward FAILED for {model_key}: {exc}")
+        # emap_ruined, _ = model.explain(image=ruined_img, text=text)
+        # visualize(emap_ruined, ruined_img, f"Images/Output/emap_ruined_{model_key}.png")
 
         #finally:
         # Free VRAM after each model before loading the next one.
