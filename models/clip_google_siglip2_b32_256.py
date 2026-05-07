@@ -15,4 +15,3 @@ class GoogleSiglip2B32_256Clip(ClipModel):
             load_on_init=load_on_init,
         )
         self.cls_token = False
-

@@ -12,15 +12,19 @@ from transformers import AutoModel, AutoProcessor
 
 import torch
 
+
 class EncodeDenseOutput(NamedTuple):
     """Output from encode_dense - all tensors needed for Grad-ECLIP."""
-    embeddings: torch.Tensor       # (batch, seq_len, hidden) - final with projection
-    q_out: torch.Tensor            # (seq_len, batch, hidden) - Q from last attention
-    k_out: torch.Tensor            # (seq_len, batch, hidden) - K from last attention
-    v: torch.Tensor                # (seq_len, batch, hidden) - V from last attention
-    att_output: torch.Tensor       # (seq_len, batch, hidden) - attention before residual
-    patch_map_size: tuple          # (H, W) - spatial grid of patches
-    classic_output: torch.Tensor   # (batch, seq_len, hidden) - final output without projection (for sanity checks)
+
+    embeddings: torch.Tensor  # (batch, seq_len, hidden) - final with projection
+    q_out: torch.Tensor  # (seq_len, batch, hidden) - Q from last attention
+    k_out: torch.Tensor  # (seq_len, batch, hidden) - K from last attention
+    v: torch.Tensor  # (seq_len, batch, hidden) - V from last attention
+    att_output: torch.Tensor  # (seq_len, batch, hidden) - attention before residual
+    patch_map_size: tuple  # (H, W) - spatial grid of patches
+    classic_output: torch.Tensor  # (batch, seq_len, hidden) - final output without projection (for sanity checks)
+    q_raw: torch.Tensor  # (seq_len, batch, hidden) - raw Q from q_proj (before out_proj)
+    k_raw: torch.Tensor  # (seq_len, batch, hidden) - raw K from k_proj (before out_proj)
 
 
 class ClipModel(ABC):
@@ -44,6 +48,9 @@ class ClipModel(ABC):
             self.load_model()
 
     def load_model(self) -> None:
+        if self.model:
+            # If we've already loaded the model we have noop
+            return
         model_kwargs = {}
         if self.torch_dtype is not None:
             model_kwargs["torch_dtype"] = self.torch_dtype
@@ -51,6 +58,15 @@ class ClipModel(ABC):
         self.model = AutoModel.from_pretrained(self.model_id, **model_kwargs)
         self.processor = AutoProcessor.from_pretrained(self.model_id)
         self.model = self.model.to(self.device)
+
+    def _set_num_heads(self, num_heads: int) -> None:
+        if not self.model:
+            self.load_model()
+        self.model.config.vision_config.num_attention_heads = num_heads
+
+    def get_num_heads(self) -> int:
+        assert self.model
+        return self.model.config.vision_config.num_attention_heads
 
     @staticmethod
     def _resolve_device(device: str | torch.device | None) -> torch.device:
@@ -119,15 +135,13 @@ class ClipModel(ABC):
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-# === GRAD-ECLIP IMPLEMENTATIONS ===
-
+    # === GRAD-ECLIP IMPLEMENTATIONS ===
 
     # Exact copy from notebook
-    # Used to compute att for explained layer 
+    # Used to compute att for explained layer
     @staticmethod
     def _attention_layer(
-        q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
-        num_heads: int = 1, attn_mask: torch.Tensor | None = None
+        q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, num_heads: int = 1, attn_mask: torch.Tensor | None = None
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Compute scaled dot-product attention (universal for all models)."""
         tgt_len, bsz, embed_dim = q.shape
@@ -152,43 +166,49 @@ class ClipModel(ABC):
         attn_output_weights = attn_output_weights.sum(dim=1) / num_heads
         return attn_output, attn_output_weights
 
-    # Exact copy from notebook 
+    # Exact copy from notebook
     def _grad_eclip(
-            self, c: torch.Tensor, q_out: torch.Tensor, k_out: torch.Tensor,
-            v: torch.Tensor, att_output: torch.Tensor, patch_map_size: tuple,
-            withksim: bool = True, cls_token: bool = True,
-        ) -> torch.Tensor:
-            """Compute Grad-ECLIP heatmap for scalar c (universal)."""
-            grad = torch.autograd.grad(c, att_output, retain_graph=True, create_graph=True)[0]
-            grad_cls = grad[:1, 0, :]
+        self,
+        c: torch.Tensor,
+        q_out: torch.Tensor,
+        k_out: torch.Tensor,
+        v: torch.Tensor,
+        att_output: torch.Tensor,
+        patch_map_size: tuple,
+        withksim: bool = True,
+        cls_token: bool = True,
+    ) -> torch.Tensor:
+        """Compute Grad-ECLIP heatmap for scalar c (universal)."""
+        grad = torch.autograd.grad(c, att_output, retain_graph=True, create_graph=True)[0]
+        grad_cls = grad[:1, 0, :]
 
-            if withksim:
-                q_cls = q_out[:1, 0, :]
-                k_patch = k_out[:, 0, :]
-                q_cls = torch.nn.functional.normalize(q_cls, dim=-1)
-                k_patch = torch.nn.functional.normalize(k_patch, dim=-1)
-                cosine_qk = (q_cls * k_patch).sum(-1)
-                cosine_qk = (cosine_qk - cosine_qk.min()) / (cosine_qk.max() - cosine_qk.min() + 1e-8)
-                emap = torch.nn.functional.relu((grad_cls * v[:, 0, :] * cosine_qk[:, None]).sum(-1))
-            else:
-                emap = torch.nn.functional.relu((grad_cls * v[:, 0, :]).sum(-1))
+        if withksim:
+            q_cls = q_out[:1, 0, :]
+            k_patch = k_out[:, 0, :]
+            q_cls = torch.nn.functional.normalize(q_cls, dim=-1)
+            k_patch = torch.nn.functional.normalize(k_patch, dim=-1)
+            cosine_qk = (q_cls * k_patch).sum(-1)
+            cosine_qk = (cosine_qk - cosine_qk.min()) / (cosine_qk.max() - cosine_qk.min() + 1e-8)
+            emap = torch.nn.functional.relu((grad_cls * v[:, 0, :] * cosine_qk[:, None]).sum(-1))
+        else:
+            emap = torch.nn.functional.relu((grad_cls * v[:, 0, :]).sum(-1))
 
-            print(f"emap shape before reshape: {emap.shape}")
-            if cls_token:
-                emap = emap[1:]  # remove CLS token
-            return emap.reshape(*patch_map_size)
+        print(f"emap shape before reshape: {emap.shape}")
+        if cls_token:
+            emap = emap[1:]  # remove CLS token
+        return emap.reshape(*patch_map_size)
 
     def _get_patch_size(self):
         return self.model.config.vision_config.patch_size
-    
+
     def explain(self, image: Image.Image, text: str, keepsize: bool = True) -> dict[str, Any]:
         """
         Compute Grad-ECLIP explanation. Universal for all model subclasses.
-        
+
         Args:
             image: PIL Image
             text: text caption
-            
+
         Returns:
             dict with 'heatmap', 'logits', 'text_embedding', 'image_embedding'
         """
@@ -201,18 +221,177 @@ class ClipModel(ABC):
             pixel_values = self.proccess_keepsize(image).unsqueeze(0).to(self.device).detach()
         else:
             inputs = self.processor(images=image, return_tensors="pt")
-            pixel_values = inputs['pixel_values'].to(self.device)
+            pixel_values = inputs["pixel_values"].to(self.device)
 
         # 2. Preprocess text
         text_inputs = self.processor(text=[text], return_tensors="pt").to(self.device)
 
-        # 3. Get text embedding 
-        text_features = self.model.get_text_features(
-            **text_inputs
-        ).pooler_output
+        # 3. Get text embedding
+        text_features = self.model.get_text_features(**text_inputs).pooler_output
         text_embedding = torch.nn.functional.normalize(text_features, dim=-1)
 
         return self.generate_hm(pixel_values, text_embedding)
+
+    def _head_grad_eclip(
+        self,
+        grad: torch.Tensor,
+        q_raw: torch.Tensor,
+        k_raw: torch.Tensor,
+        v: torch.Tensor,
+        patch_map_size: tuple,
+        head_idx: int,
+        head_dim: int,
+    ) -> torch.Tensor:
+        """Grad-ECLIP heatmap for a single attention head (head_idx)."""
+        s, e = head_idx * head_dim, (head_idx + 1) * head_dim
+        grad_cls_h = grad[:1, 0, s:e]
+        q_n = torch.nn.functional.normalize(q_raw[:1, 0, s:e], dim=-1)
+        k_n = torch.nn.functional.normalize(k_raw[:, 0, s:e], dim=-1)
+        cosine_qk = (q_n * k_n).sum(-1)
+        cosine_qk = (cosine_qk - cosine_qk.min()) / (cosine_qk.max() - cosine_qk.min() + 1e-8)
+        emap = torch.nn.functional.relu((grad_cls_h * v[:, 0, s:e] * cosine_qk[:, None]).sum(-1))
+        if self.cls_token:
+            emap = emap[1:]
+        emap = emap.reshape(*patch_map_size)
+        return (emap - emap.min()) / (emap.max() + 1e-8)
+
+    def generate_head_hm(self, pixel_values: torch.Tensor, text_embedding: torch.Tensor, head_idx: int):
+        """Like generate_hm but computes Grad-ECLIP for a single attention head.
+        Uses create_graph=True so it can be used inside an attack loop."""
+        vcfg = self.model.config.vision_config
+        head_dim = vcfg.hidden_size // vcfg.num_attention_heads
+
+        dense = self.encode_dense(pixel_values)
+        img_embedding = torch.nn.functional.normalize(dense.embeddings, dim=-1)
+        c = (img_embedding @ text_embedding.T)[0][0]
+
+        grad = torch.autograd.grad(c, dense.att_output, retain_graph=True, create_graph=True)[0]
+        emap = self._head_grad_eclip(grad, dense.q_raw, dense.k_raw, dense.v, dense.patch_map_size, head_idx, head_dim)
+        return emap, dense.classic_output
+
+    def explain_per_head(self, image, text: str) -> list[torch.Tensor]:
+        """Compute Grad-ECLIP heatmap for every attention head. Returns list of (H, W) tensors."""
+        vcfg = self.model.config.vision_config
+        num_heads = vcfg.num_attention_heads
+        head_dim = vcfg.hidden_size // num_heads
+
+        pixel_values = self.proccess_keepsize(image).unsqueeze(0).to(self.device).detach()
+        text_inputs = self.processor(text=[text], return_tensors="pt").to(self.device)
+        text_features = self.model.get_text_features(**text_inputs)
+        if hasattr(text_features, "pooler_output"):
+            text_features = text_features.pooler_output
+        text_embedding = torch.nn.functional.normalize(text_features, dim=-1)
+
+        dense = self.encode_dense(pixel_values)
+        img_embedding = torch.nn.functional.normalize(dense.embeddings, dim=-1)
+        c = (img_embedding @ text_embedding.T)[0][0]
+        grad = torch.autograd.grad(c, dense.att_output, retain_graph=False)[0]
+
+        return [
+            self._head_grad_eclip(grad, dense.q_raw, dense.k_raw, dense.v, dense.patch_map_size, h, head_dim)
+            for h in range(num_heads)
+        ]
+
+    def generate_all_heads_hm(self, pixel_values: torch.Tensor, text_embedding: torch.Tensor):
+        """Compute Grad-ECLIP for all attention heads with create_graph=True (for attack loops).
+        Returns list of (H, W) heatmaps and classic_output."""
+        vcfg = self.model.config.vision_config
+        num_heads = vcfg.num_attention_heads
+        head_dim = vcfg.hidden_size // num_heads
+
+        dense = self.encode_dense(pixel_values)
+        img_embedding = torch.nn.functional.normalize(dense.embeddings, dim=-1)
+        c = (img_embedding @ text_embedding.T)[0][0]
+
+        grad = torch.autograd.grad(c, dense.att_output, retain_graph=True, create_graph=True)[0]
+        emaps = [
+            self._head_grad_eclip(grad, dense.q_raw, dense.k_raw, dense.v, dense.patch_map_size, h, head_dim)
+            for h in range(num_heads)
+        ]
+        return emaps, dense.classic_output
+
+    def ruin_all_heads(self, img, text: str, target_explanation: torch.Tensor, DELTA: float = 0.03):
+        """Attack all heads simultaneously. Loss = sum of MSE(head_heatmap, target) over all heads."""
+        transform = self._get_transform()
+        img = self._proccess_keepsize(img)
+        img_tensor = transform.transforms[0](img).to(self.device).unsqueeze(0).detach()
+
+        inputs = self.processor(text=[text], return_tensors="pt").to(self.device)
+        text_features = self.model.get_text_features(**inputs)
+        if hasattr(text_features, "pooler_output"):
+            text_features = text_features.pooler_output
+        text_embedding = torch.nn.functional.normalize(text_features.detach(), dim=-1)
+
+        change_tensor = torch.zeros_like(img_tensor, requires_grad=True)
+        optimizer = torch.optim.Adam([change_tensor], lr=0.1)
+
+        target_resized: torch.Tensor | None = None
+        original_embedding: torch.Tensor | None = None
+        losses: list[float] = []
+
+        for _ in tqdm.tqdm(range(50), desc="ruin_all_heads"):
+            image_changed = img_tensor + (torch.sigmoid(change_tensor) * 2 - 1) * DELTA
+            emaps, embedding = self.generate_all_heads_hm(transform.transforms[1](image_changed), text_embedding)
+
+            if target_resized is None:
+                hm_resize = torchvision.transforms.Resize(emaps[0].shape[-2:])
+                target_resized = hm_resize(target_explanation.to(self.device).unsqueeze(0))[0]
+
+            loss = ((torch.stack(emaps) - target_resized) ** 2).sum()
+
+            if original_embedding is None:
+                original_embedding = embedding.detach()
+            else:
+                loss = loss + torch.sum((embedding - original_embedding) ** 2)
+
+            losses.append(loss.item())
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+        image_changed = torch.clamp(img_tensor + (torch.sigmoid(change_tensor) * 2 - 1) * DELTA, 0, 1)
+        return torchvision.transforms.ToPILImage()(image_changed[0].detach()), losses
+
+    def ruin_head(self, img, text: str, target_explanation: torch.Tensor, attack_head: int, DELTA: float = 0.03):
+        """Like ruin() but optimises only attack_head's Grad-ECLIP to match target_explanation."""
+        transform = self._get_transform()
+        img = self._proccess_keepsize(img)
+        img_tensor = transform.transforms[0](img).to(self.device).unsqueeze(0).detach()
+
+        inputs = self.processor(text=[text], return_tensors="pt").to(self.device)
+        text_features = self.model.get_text_features(**inputs)
+        if hasattr(text_features, "pooler_output"):
+            text_features = text_features.pooler_output
+        text_embedding = torch.nn.functional.normalize(text_features.detach(), dim=-1)
+
+        change_tensor = torch.zeros_like(img_tensor, requires_grad=True)
+        optimizer = torch.optim.Adam([change_tensor], lr=0.1)
+
+        target_resized: torch.Tensor | None = None
+        original_embedding: torch.Tensor | None = None
+        losses: list[float] = []
+
+        for _ in tqdm.tqdm(range(50), desc=f"ruin_head {attack_head}"):
+            image_changed = img_tensor + (torch.sigmoid(change_tensor) * 2 - 1) * DELTA
+            hm, embedding = self.generate_head_hm(transform.transforms[1](image_changed), text_embedding, attack_head)
+
+            if target_resized is None:
+                hm_resize = torchvision.transforms.Resize(hm.shape[-2:])
+                target_resized = hm_resize(target_explanation.to(self.device).unsqueeze(0))[0]
+
+            loss = torch.sum((hm - target_resized) ** 2)
+            if original_embedding is None:
+                original_embedding = embedding.detach()
+            else:
+                loss = loss + torch.sum((embedding - original_embedding) ** 2)
+
+            losses.append(loss.item())
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+        image_changed = torch.clamp(img_tensor + (torch.sigmoid(change_tensor) * 2 - 1) * DELTA, 0, 1)
+        return torchvision.transforms.ToPILImage()(image_changed[0].detach()), losses
 
     def generate_hm(self, pixel_values, text_embedding):
         # 4. Encode image (each subclass implements this differently)
@@ -223,13 +402,19 @@ class ClipModel(ABC):
 
         # 6. Compute cosine similarities
         cosines = (img_embedding @ text_embedding.T)[0]
-        
 
         # 7. Compute Grad-ECLIP for each scalar
         emap_list = [
-            self._grad_eclip(c, dense_output.q_out, dense_output.k_out, dense_output.v,
-                             dense_output.att_output, dense_output.patch_map_size, withksim=True,
-                             cls_token=self.cls_token)
+            self._grad_eclip(
+                c,
+                dense_output.q_out,
+                dense_output.k_out,
+                dense_output.v,
+                dense_output.att_output,
+                dense_output.patch_map_size,
+                withksim=True,
+                cls_token=self.cls_token,
+            )
             for c in cosines
         ]
         emap = torch.stack(emap_list, dim=0).sum(0)
@@ -246,11 +431,12 @@ class ClipModel(ABC):
         mean = tuple(float(x) for x in image_processor.image_mean)
         std = tuple(float(x) for x in image_processor.image_std)
 
-        return torchvision.transforms.Compose([
-            torchvision.transforms.ToTensor(),
-            torchvision.transforms.Normalize(mean, std),
-        ]) 
-
+        return torchvision.transforms.Compose(
+            [
+                torchvision.transforms.ToTensor(),
+                torchvision.transforms.Normalize(mean, std),
+            ]
+        )
 
     def _proccess_keepsize(self, img, scale_factor=1.0):
         w, h = img.size
@@ -260,7 +446,9 @@ class ClipModel(ABC):
         new_width = int(w * scale_factor / patch_width + 0.5) * patch_width
         new_height = int(h * scale_factor / patch_height + 0.5) * patch_height
 
-        ResizeOp = torchvision.transforms.Resize((new_height, new_width), interpolation=torchvision.transforms.InterpolationMode.BICUBIC)
+        ResizeOp = torchvision.transforms.Resize(
+            (new_height, new_width), interpolation=torchvision.transforms.InterpolationMode.BICUBIC
+        )
         img = ResizeOp(img).convert("RGB")
         return img
 
@@ -276,8 +464,7 @@ class ClipModel(ABC):
         clip_ksize = self.model.vision_model.embeddings.patch_embedding.kernel_size
 
         # modified from CLIP
-        #x = x.half()
-
+        # x = x.half()
 
         x = self.model.vision_model.embeddings.patch_embedding(pixel_values)
         feah, feaw = x.shape[-2:]
@@ -288,30 +475,30 @@ class ClipModel(ABC):
 
         x = torch.cat([class_embedding + torch.zeros(x.shape[0], 1, x.shape[-1]).to(x), x], dim=1)
 
-        #pos_embedding = clipmodel.visual.positional_embedding.to(x.dtype) HF
+        # pos_embedding = clipmodel.visual.positional_embedding.to(x.dtype) HF
         pos_embedding = self.model.vision_model.embeddings.position_embedding.weight
 
         tok_pos, img_pos = pos_embedding[:1, :], pos_embedding[1:, :]
         pos_h = clip_inres // clip_ksize[0]
         pos_w = clip_inres // clip_ksize[1]
-        assert img_pos.size(0) == (pos_h * pos_w), f"the size of pos_embedding ({img_pos.size(0)}) does not match resolution shape pos_h ({pos_h}) * pos_w ({pos_w})"
+        assert img_pos.size(0) == (
+            pos_h * pos_w
+        ), f"the size of pos_embedding ({img_pos.size(0)}) does not match resolution shape pos_h ({pos_h}) * pos_w ({pos_w})"
         img_pos = img_pos.reshape(1, pos_h, pos_w, img_pos.shape[1]).permute(0, 3, 1, 2)
-        img_pos = torch.nn.functional.interpolate(img_pos, size=(feah, feaw), mode='bicubic', align_corners=False)
+        img_pos = torch.nn.functional.interpolate(img_pos, size=(feah, feaw), mode="bicubic", align_corners=False)
         img_pos = img_pos.reshape(1, img_pos.shape[1], -1).permute(0, 2, 1)
         pos_embedding = torch.cat((tok_pos[None, ...], img_pos), dim=1)
 
         return x + pos_embedding, (feah, feaw)
-    
-    def grad_eclip_attention_layer(
-        self, targetLayer, x_in
-    ):
+
+    def grad_eclip_attention_layer(self, targetLayer, x_in):
         x_before_attn = targetLayer.layer_norm1(x_in)
 
         q = targetLayer.self_attn.q_proj(x_before_attn)
         k = targetLayer.self_attn.k_proj(x_before_attn)
         v = targetLayer.self_attn.v_proj(x_before_attn)
 
-        attn_output, attn = ClipModel._attention_layer(q, k, v, 1) #vision_heads
+        attn_output, attn = ClipModel._attention_layer(q, k, v, self.get_num_heads())  # vision_heads
 
         x_after_attn = targetLayer.self_attn.out_proj(attn_output)
 
@@ -327,7 +514,6 @@ class ClipModel(ABC):
         qkv = targetLayer.self_attn.out_proj(qkv)
         q_out, k_out, v_out = qkv[0], qkv[1], qkv[2]
 
-
         # TODO czy my tego używamy
         # v_final = v_out + x_in
         # v_final = v_final + targetTR_2.mlp(targetTR_2.layer_norm2(v_final))
@@ -337,7 +523,7 @@ class ClipModel(ABC):
 
         # v_final = self.model.visual_projection(v_final)
         ##############
-        return x, q_out, k_out, v, attn_output
+        return x, q_out, k_out, v, attn_output, q, k
 
     def encode_dense(self, pixel_values: torch.Tensor) -> EncodeDenseOutput:
         # Potentially cound be deleted
@@ -358,15 +544,19 @@ class ClipModel(ABC):
             x_in = module(x_in, None)
 
         if hasattr(self.model, "visual_projection"):
-            classic_prediction = self.model.visual_projection(self.model.vision_model.post_layernorm(self.model.vision_model.encoder.layers[-1](x_in, None)[:,0,:]))
+            classic_prediction = self.model.visual_projection(
+                self.model.vision_model.post_layernorm(self.model.vision_model.encoder.layers[-1](x_in, None)[:, 0, :])
+            )
         else:
-            classic_prediction = self.model.vision_model.head(self.model.vision_model.post_layernorm(self.model.vision_model.encoder.layers[-1](x_in, None)))
+            classic_prediction = self.model.vision_model.head(
+                self.model.vision_model.post_layernorm(self.model.vision_model.encoder.layers[-1](x_in, None))
+            )
 
         x_in = x_in.permute(1, 0, 2)
 
         ##################
         # LastTR.attention
-        x, q_out, k_out, v, attn_output = self.grad_eclip_attention_layer(
+        x, q_out, k_out, v, attn_output, q_raw, k_raw = self.grad_eclip_attention_layer(
             self.model.vision_model.encoder.layers[-1], x_in
         )
 
@@ -377,7 +567,6 @@ class ClipModel(ABC):
         else:
             x = self.model.vision_model.head(x)
 
-
         print("embeddings shape:", x.shape)
         return EncodeDenseOutput(
             embeddings=x,
@@ -386,17 +575,19 @@ class ClipModel(ABC):
             v=v,
             att_output=attn_output,
             patch_map_size=patch_map_size,
-            classic_output=classic_prediction
+            classic_output=classic_prediction,
+            q_raw=q_raw,
+            k_raw=k_raw,
         )
 
-    def ruin(self, img: Image.Image, text: str, target_explanation: torch.Tensor, DELTA = 0.03) -> Image.Image:
+    def ruin(self, img: Image.Image, text: str, target_explanation: torch.Tensor, DELTA=0.03) -> Image.Image:
 
         transform = self._get_transform()
         img = self._proccess_keepsize(img)
         img_tensor = transform.transforms[0](img).to(self.device).unsqueeze(0).detach()
         # img_tensor = imgprocess_size_transform(img).to(device).unsqueeze(0).detach()
 
-        target_resized: typing.Optional[torch.Tensor] = None 
+        target_resized: typing.Optional[torch.Tensor] = None
 
         # feed forward text
         inputs = self.processor(text=[text], return_tensors="pt").to(self.device)
@@ -418,24 +609,26 @@ class ClipModel(ABC):
             image_changed_processed = transform.transforms[1](image_changed)
 
             hm, embedding = self.generate_hm(image_changed_processed, text_embedding)
-            
+
             if target_resized is None:
                 try:
                     hm_resize = torchvision.transforms.Resize(hm.shape[-2:])
                     target_resized = (hm_resize(target_explanation.to(self.device).unsqueeze(0)))[0]
                 except RuntimeError:
-                    hm_resize = torchvision.transforms.Resize(hm.shape[-2:], interpolation=torchvision.transforms.InterpolationMode.NEAREST)
+                    hm_resize = torchvision.transforms.Resize(
+                        hm.shape[-2:], interpolation=torchvision.transforms.InterpolationMode.NEAREST
+                    )
                     target_resized = (hm_resize(target_explanation.to(self.device).unsqueeze(0)))[0]
 
             assert target_resized.shape == hm.shape
 
-            loss1 = torch.sum((hm - target_resized)**2)
+            loss1 = torch.sum((hm - target_resized) ** 2)
 
             if original_embedding is None:
                 original_embedding = embedding.detach()
                 loss2 = torch.tensor(0).to(self.device)
             else:
-                loss2 = torch.sum((embedding - original_embedding)**2)
+                loss2 = torch.sum((embedding - original_embedding) ** 2)
 
             embeddings.append(embedding.detach())
 
