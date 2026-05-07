@@ -17,9 +17,11 @@ from PIL import Image
 
 from models import build_clip_model, CLIP_MODEL_REGISTRY
 
-IMAGE_PATH = "Images/SampleImages/dog_and_car.png"
+IMAGE_PATH = "Images/Output/all_heads_attack/openai-vit-b16_perturbed_all_heads.png"
 TEXT = "a dog in a car waiting for traffic lights"
-OUT_DIR = "Images/Output/multihead"
+OUT_DIR = "Images/Output/multihead/explain_whith12_attacked_on6"
+NUM_HEADS = 12
+MODEL_KEY = "openai-vit-b16"
 
 
 def overlay_heatmap(hmap: torch.Tensor, image_np: np.ndarray) -> np.ndarray:
@@ -33,8 +35,7 @@ def overlay_heatmap(hmap: torch.Tensor, image_np: np.ndarray) -> np.ndarray:
 
 def run_model(model_key: str, image: Image.Image) -> None:
     print(f"\n=== {model_key} ===")
-    model = build_clip_model(model_key, device="cuda:0" if torch.cuda.is_available() else "cpu", load_on_init=False)
-    model.load_model()
+    model = build_clip_model(model_key, num_heads=NUM_HEADS)
 
     vcfg = model.model.config.vision_config
     num_heads = vcfg.num_attention_heads
@@ -75,5 +76,6 @@ if __name__ == "__main__":
 
     load_dotenv()
     image = Image.open(IMAGE_PATH).convert("RGB")
-    for model_key in CLIP_MODEL_REGISTRY:
-        run_model(model_key, image)
+    # for model_key in CLIP_MODEL_REGISTRY:
+    #     run_model(model_key, image)
+    run_model(model_key=MODEL_KEY, image=image)

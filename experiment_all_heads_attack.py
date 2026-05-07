@@ -25,6 +25,7 @@ TARGET_PATH = "Images/targets/smiley.gif"
 TEXT = "a dog in a car waiting for traffic lights"
 MODEL_KEY = "openai-vit-b16"
 OUT_DIR = "Images/Output/all_heads_attack"
+NUM_HEADS = 6
 
 
 def make_figure(image_np, target_np, emaps_before, emaps_after, model_key):
@@ -76,8 +77,7 @@ def main() -> None:
     image = Image.open(IMAGE_PATH).convert("RGB")
     target_tensor = 1 - torchvision.transforms.ToTensor()(Image.open(TARGET_PATH).convert("RGBA"))[0, :, :]
 
-    model = build_clip_model(MODEL_KEY, load_on_init=False)
-    model.load_model()
+    model = build_clip_model(MODEL_KEY, num_heads=NUM_HEADS)
 
     image_np = np.asarray(model._proccess_keepsize(image))
     target_np = target_tensor.numpy()

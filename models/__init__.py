@@ -4,6 +4,7 @@ from .clip_openai_vit_b16 import OpenAIViTB16Clip
 from .clip_openai_vit_l14 import OpenAIViTL14Clip
 from .clip_google_siglip2_b32_256 import GoogleSiglip2B32_256Clip
 from .clip_facebook_metaclip2_b16 import FacebookMetaClip2B16Clip
+from typing import Optional
 
 CLIP_MODEL_REGISTRY = {
     "openai-vit-b32": OpenAIViTB32Clip,
@@ -14,12 +15,15 @@ CLIP_MODEL_REGISTRY = {
 }
 
 
-def build_clip_model(model_key: str, **kwargs):
+def build_clip_model(model_key: str, num_heads: Optional[int] = None, **kwargs) -> ClipModel:
     """Simple factory to build one of registered CLIP model wrappers."""
     if model_key not in CLIP_MODEL_REGISTRY:
         available = ", ".join(sorted(CLIP_MODEL_REGISTRY.keys()))
         raise ValueError(f"Unknown model_key={model_key}. Available: {available}")
-    return CLIP_MODEL_REGISTRY[model_key](**kwargs)
+    model: ClipModel =  CLIP_MODEL_REGISTRY[model_key](**kwargs)
+    if num_heads:
+        model._set_num_heads(num_heads)
+    return model
 
 
 __all__ = [

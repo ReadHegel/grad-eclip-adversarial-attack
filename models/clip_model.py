@@ -36,7 +36,6 @@ class ClipModel(ABC):
         device: str | torch.device | None = None,
         torch_dtype: torch.dtype | None = None,
         load_on_init: bool = True,
-        num_heads: int = 1,
     ) -> None:
         self.model_id = model_id
         self.torch_dtype = torch_dtype
@@ -44,12 +43,14 @@ class ClipModel(ABC):
 
         self.model: Any | None = None
         self.processor: Any | None = None
-        self.num_heads = num_heads
 
         if load_on_init:
             self.load_model()
 
     def load_model(self) -> None:
+        if self.model:
+            # If we've already loaded the model we have noop
+            return
         model_kwargs = {}
         if self.torch_dtype is not None:
             model_kwargs["torch_dtype"] = self.torch_dtype
@@ -57,6 +58,15 @@ class ClipModel(ABC):
         self.model = AutoModel.from_pretrained(self.model_id, **model_kwargs)
         self.processor = AutoProcessor.from_pretrained(self.model_id)
         self.model = self.model.to(self.device)
+
+    def _set_num_heads(self, num_heads: int) -> None:
+        if not self.model:
+            self.load_model()
+        self.model.config.vision_config.num_attention_heads = num_heads
+
+    def get_num_heads(self) -> int:
+        assert self.model
+        return self.model.config.vision_config.num_attention_heads
 
     @staticmethod
     def _resolve_device(device: str | torch.device | None) -> torch.device:
@@ -488,7 +498,7 @@ class ClipModel(ABC):
         k = targetLayer.self_attn.k_proj(x_before_attn)
         v = targetLayer.self_attn.v_proj(x_before_attn)
 
-        attn_output, attn = ClipModel._attention_layer(q, k, v, self.num_heads)  # vision_heads
+        attn_output, attn = ClipModel._attention_layer(q, k, v, self.get_num_heads())  # vision_heads
 
         x_after_attn = targetLayer.self_attn.out_proj(attn_output)
 
