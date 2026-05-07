@@ -7,6 +7,7 @@ import torch
 
 from .clip_model import ClipModel, EncodeDenseOutput
 
+
 class OpenAIViTB32Clip(ClipModel):
     def __init__(self, device: str | None = None, load_on_init: bool = True) -> None:
         super().__init__(

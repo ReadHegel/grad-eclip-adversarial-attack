@@ -5,7 +5,6 @@ from .clip_openai_vit_l14 import OpenAIViTL14Clip
 from .clip_google_siglip2_b32_256 import GoogleSiglip2B32_256Clip
 from .clip_facebook_metaclip2_b16 import FacebookMetaClip2B16Clip
 
-
 CLIP_MODEL_REGISTRY = {
     "openai-vit-b32": OpenAIViTB32Clip,
     "openai-vit-b16": OpenAIViTB16Clip,

@@ -19,6 +19,7 @@ dependencies = [
     "rich>=13.0",
     "ipykernel>=6.0",
     "jupyter>=1.0",
+    "black>=26.3.1",
 ]
 
 [tool.uv.sources]
@@ -29,3 +30,15 @@ torchvision = [{ index = "pytorch-cu124" }]
 name = "pytorch-cu124"
 url = "https://download.pytorch.org/whl/cu124"
 explicit = true
+
+[tool.black]
+line-length = 120
+target-version = ['py311', 'py312', 'py313']
+include = '\.pyi?$'
+extend-exclude = '''
+/(
+  # directories
+  \.venv
+  | build
+)/
+'''

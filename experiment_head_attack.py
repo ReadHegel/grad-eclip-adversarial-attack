@@ -20,12 +20,12 @@ from PIL import Image
 from models import build_clip_model
 from multihead_explain import overlay_heatmap
 
-IMAGE_PATH  = "Images/SampleImages/dog_and_car.png"
+IMAGE_PATH = "Images/SampleImages/dog_and_car.png"
 TARGET_PATH = "Images/targets/smiley.gif"
-TEXT        = "a dog in a car waiting for traffic lights"
-MODEL_KEY   = "openai-vit-b16"
+TEXT = "a dog in a car waiting for traffic lights"
+MODEL_KEY = "openai-vit-b16"
 ATTACK_HEAD = 0
-OUT_DIR     = "Images/Output/head_attack"
+OUT_DIR = "Images/Output/head_attack"
 
 
 def make_figure(image_np, target_np, emaps_before, emaps_after, attack_head, model_key):
@@ -44,12 +44,13 @@ def make_figure(image_np, target_np, emaps_before, emaps_after, attack_head, mod
 
     colors = ["red" if h == attack_head else "steelblue" for h in range(num_heads)]
     axes[0, 2].bar(range(num_heads), mse, color=colors)
-    axes[0, 2].set(xlabel="Head", ylabel="MSE before→after",
-                   title=f"Cross-head impact (attacked head {attack_head} in red)")
+    axes[0, 2].set(
+        xlabel="Head", ylabel="MSE before→after", title=f"Cross-head impact (attacked head {attack_head} in red)"
+    )
     axes[0, 2].set_xticks(range(num_heads))
 
     for h in range(num_heads):
-        color  = "red" if h == attack_head else "black"
+        color = "red" if h == attack_head else "black"
         prefix = "★ " if h == attack_head else ""
 
         axes[h + 1, 0].imshow(overlay_heatmap(emaps_before[h], image_np))
@@ -62,7 +63,7 @@ def make_figure(image_np, target_np, emaps_before, emaps_after, attack_head, mod
 
         diff = (emaps_after[h] - emaps_before[h]).abs()
         diff = (diff - diff.min()) / (diff.max() + 1e-8)
-        resize  = torchvision.transforms.Resize(
+        resize = torchvision.transforms.Resize(
             image_np.shape[:2],
             interpolation=torchvision.transforms.InterpolationMode.NEAREST,
         )
@@ -71,7 +72,7 @@ def make_figure(image_np, target_np, emaps_before, emaps_after, attack_head, mod
         axes[h + 1, 2].set_title(f"{prefix}Head {h} — |Δ| mse={mse[h]:.4f}", fontsize=8, color=color)
         axes[h + 1, 2].axis("off")
 
-    plt.suptitle(f"{model_key}  |  \"{TEXT}\"", fontsize=10, y=1.01)
+    plt.suptitle(f'{model_key}  |  "{TEXT}"', fontsize=10, y=1.01)
     plt.tight_layout()
     return fig
 
@@ -79,16 +80,14 @@ def make_figure(image_np, target_np, emaps_before, emaps_after, attack_head, mod
 def main() -> None:
     load_dotenv()
 
-    image  = Image.open(IMAGE_PATH).convert("RGB")
+    image = Image.open(IMAGE_PATH).convert("RGB")
     # Same target loading as in the notebooks
-    target_tensor = 1 - torchvision.transforms.ToTensor()(
-        Image.open(TARGET_PATH).convert("RGBA")
-    )[0, :, :]
+    target_tensor = 1 - torchvision.transforms.ToTensor()(Image.open(TARGET_PATH).convert("RGBA"))[0, :, :]
 
     model = build_clip_model(MODEL_KEY, load_on_init=False)
     model.load_model()
 
-    image_np  = np.asarray(model._proccess_keepsize(image))
+    image_np = np.asarray(model._proccess_keepsize(image))
     target_np = target_tensor.numpy()
 
     print("Computing baseline explanations...")
