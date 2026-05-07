@@ -282,6 +282,66 @@ class ClipModel(ABC):
             for h in range(num_heads)
         ]
 
+    def generate_all_heads_hm(self, pixel_values: torch.Tensor, text_embedding: torch.Tensor):
+        """Compute Grad-ECLIP for all attention heads with create_graph=True (for attack loops).
+        Returns list of (H, W) heatmaps and classic_output."""
+        vcfg = self.model.config.vision_config
+        num_heads = vcfg.num_attention_heads
+        head_dim = vcfg.hidden_size // num_heads
+
+        dense = self.encode_dense(pixel_values)
+        img_embedding = torch.nn.functional.normalize(dense.embeddings, dim=-1)
+        c = (img_embedding @ text_embedding.T)[0][0]
+
+        grad = torch.autograd.grad(c, dense.att_output, retain_graph=True, create_graph=True)[0]
+        emaps = [
+            self._head_grad_eclip(grad, dense.q_raw, dense.k_raw, dense.v, dense.patch_map_size, h, head_dim)
+            for h in range(num_heads)
+        ]
+        return emaps, dense.classic_output
+
+    def ruin_all_heads(self, img, text: str, target_explanation: torch.Tensor, DELTA: float = 0.03):
+        """Attack all heads simultaneously. Loss = sum of MSE(head_heatmap, target) over all heads."""
+        transform = self._get_transform()
+        img = self._proccess_keepsize(img)
+        img_tensor = transform.transforms[0](img).to(self.device).unsqueeze(0).detach()
+
+        inputs = self.processor(text=[text], return_tensors="pt").to(self.device)
+        text_features = self.model.get_text_features(**inputs)
+        if hasattr(text_features, "pooler_output"):
+            text_features = text_features.pooler_output
+        text_embedding = torch.nn.functional.normalize(text_features.detach(), dim=-1)
+
+        change_tensor = torch.zeros_like(img_tensor, requires_grad=True)
+        optimizer = torch.optim.Adam([change_tensor], lr=0.1)
+
+        target_resized: torch.Tensor | None = None
+        original_embedding: torch.Tensor | None = None
+        losses: list[float] = []
+
+        for _ in tqdm.tqdm(range(50), desc="ruin_all_heads"):
+            image_changed = img_tensor + (torch.sigmoid(change_tensor) * 2 - 1) * DELTA
+            emaps, embedding = self.generate_all_heads_hm(transform.transforms[1](image_changed), text_embedding)
+
+            if target_resized is None:
+                hm_resize = torchvision.transforms.Resize(emaps[0].shape[-2:])
+                target_resized = hm_resize(target_explanation.to(self.device).unsqueeze(0))[0]
+
+            loss = ((torch.stack(emaps) - target_resized) ** 2).sum()
+
+            if original_embedding is None:
+                original_embedding = embedding.detach()
+            else:
+                loss = loss + torch.sum((embedding - original_embedding) ** 2)
+
+            losses.append(loss.item())
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+        image_changed = torch.clamp(img_tensor + (torch.sigmoid(change_tensor) * 2 - 1) * DELTA, 0, 1)
+        return torchvision.transforms.ToPILImage()(image_changed[0].detach()), losses
+
     def ruin_head(self, img, text: str, target_explanation: torch.Tensor, attack_head: int, DELTA: float = 0.03):
         """Like ruin() but optimises only attack_head's Grad-ECLIP to match target_explanation."""
         transform = self._get_transform()

@@ -12,10 +12,8 @@
 
 set -e
 
-cd /home/ml_seminar_diff/grad-eclip-adversarial-attack
-
 export $(cat .env | xargs)
 
 mkdir -p logs
 
-uv run python -u "$@"
+PYTHONUNBUFFERED=1 uv run "$@"
