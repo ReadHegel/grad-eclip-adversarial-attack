@@ -20,7 +20,7 @@ def build_clip_model(model_key: str, num_heads: Optional[int] = None, **kwargs) 
     if model_key not in CLIP_MODEL_REGISTRY:
         available = ", ".join(sorted(CLIP_MODEL_REGISTRY.keys()))
         raise ValueError(f"Unknown model_key={model_key}. Available: {available}")
-    model: ClipModel =  CLIP_MODEL_REGISTRY[model_key](**kwargs)
+    model: ClipModel = CLIP_MODEL_REGISTRY[model_key](**kwargs)
     if num_heads:
         model._set_num_heads(num_heads)
     return model
