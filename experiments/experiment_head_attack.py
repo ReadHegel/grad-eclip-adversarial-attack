@@ -18,7 +18,7 @@ from dotenv import load_dotenv
 from PIL import Image
 
 from models import build_clip_model
-from multihead_explain import overlay_heatmap
+from experiments.multihead_explain import overlay_heatmap
 
 IMAGE_PATH = "Images/SampleImages/dog_and_car.png"
 TARGET_PATH = "Images/targets/smiley.gif"

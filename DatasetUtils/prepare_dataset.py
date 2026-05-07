@@ -34,9 +34,7 @@ def download_file(url: str, dest: Path, desc: str = "") -> Path:
     response = requests.get(url, stream=True, timeout=60)
     response.raise_for_status()
     total = int(response.headers.get("content-length", 0))
-    with open(dest, "wb") as f, tqdm(
-        total=total, unit="B", unit_scale=True, desc=desc, leave=False
-    ) as pbar:
+    with open(dest, "wb") as f, tqdm(total=total, unit="B", unit_scale=True, desc=desc, leave=False) as pbar:
         for chunk in response.iter_content(chunk_size=1 << 16):
             f.write(chunk)
             pbar.update(len(chunk))
@@ -186,13 +184,12 @@ def main():
 
     # --- Step 3: download images ---
     print(f"Downloading {args.n} images...")
-    download_tasks = [
-        (all_samples[iid]["filename"], images_dir / all_samples[iid]["filename"])
-        for iid in selected_ids
-    ]
+    download_tasks = [(all_samples[iid]["filename"], images_dir / all_samples[iid]["filename"]) for iid in selected_ids]
     failed = []
     with ThreadPoolExecutor(max_workers=args.workers) as pool:
-        futures = {pool.submit(download_image, fname, dest): iid for iid, (fname, dest) in zip(selected_ids, download_tasks)}
+        futures = {
+            pool.submit(download_image, fname, dest): iid for iid, (fname, dest) in zip(selected_ids, download_tasks)
+        }
         for future in tqdm(as_completed(futures), total=len(futures), desc="images"):
             iid = futures[future]
             if not future.result():
@@ -213,14 +210,16 @@ def main():
         png_path = targets_dir / f"target_{sample_id}.png"
         save_mask(mask, npy_path, png_path)
 
-        index.append({
-            "id": sample_id,
-            "coco_image_id": iid,
-            "image_path": str(Path("images") / sample["filename"]),
-            "caption": sample["caption"],
-            "target_path": str(Path("targets") / f"target_{sample_id}.npy"),
-            "target_type": mask_type,
-        })
+        index.append(
+            {
+                "id": sample_id,
+                "coco_image_id": iid,
+                "image_path": str(Path("images") / sample["filename"]),
+                "caption": sample["caption"],
+                "target_path": str(Path("targets") / f"target_{sample_id}.npy"),
+                "target_type": mask_type,
+            }
+        )
 
     # --- Step 5: save index + splits ---
     rng.shuffle(index)
