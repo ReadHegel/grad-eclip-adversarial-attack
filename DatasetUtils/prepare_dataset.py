@@ -1,261 +1,311 @@
-"""
-Prepares the dataset for adversarial explanation manipulation evaluation.
+from __future__ import annotations
 
-Downloads 1000 images with captions from COCO val2017 and generates
-random target masks for use as attack targets.
-
-Usage:
-    uv run python prepare_dataset.py --n 1000 --output dataset/ --seed 42
-    uv run python prepare_dataset.py --n 5 --output dataset_test/ --seed 42  # quick test
-"""
-
-import argparse
+import csv
 import json
+import os
 import random
-import zipfile
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+from typing import Any, Iterable
+from dataclasses import dataclass
 
 import numpy as np
-import requests
+import torch
 from PIL import Image
-from scipy.ndimage import gaussian_filter
+from dotenv import load_dotenv
 from tqdm import tqdm
 
-COCO_ANNOTATIONS_URL = "http://images.cocodataset.org/annotations/annotations_trainval2017.zip"
-COCO_IMAGES_BASE_URL = "http://images.cocodataset.org/val2017"
-TARGET_SIZE = 64
+from models import build_clip_model
 
 
-def download_file(url: str, dest: Path, desc: str = "") -> Path:
-    if dest.exists():
-        return dest
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    response = requests.get(url, stream=True, timeout=60)
-    response.raise_for_status()
-    total = int(response.headers.get("content-length", 0))
-    with open(dest, "wb") as f, tqdm(total=total, unit="B", unit_scale=True, desc=desc, leave=False) as pbar:
-        for chunk in response.iter_content(chunk_size=1 << 16):
-            f.write(chunk)
-            pbar.update(len(chunk))
-    return dest
+MODEL_KEYS = [
+	"openai-vit-b32",
+	"openai-vit-b16",
+	"openai-vit-l14",
+	"google-siglip2-b32-256",
+	"facebook-metaclip2-b16",
+]
+
+# --- Simple global config (edit as needed) ---------------------------------
+# Which models to generate datasets for (set to a single model to limit work)
+SELECT_MODEL_KEYS = ["openai-vit-b16"]
+
+# Sizes and randomness
+SEED = 42
+TRAIN_SIZE = 4000
+TEST_SIZE = 1000
+ATTACK_RATIO = 0.5
+
+# Paths
+COCO_ROOT = Path("DatasetUtils/data/coco_test_set")
+QUICKDRAW_ROOT = Path("DatasetUtils/data/quick_draw_dataset/npy_files")
+OUTPUT_ROOT = Path("DatasetUtils/data/generated_datasets")
+# Target save size (width, height)
+TARGET_SIZE = (640, 478)
+# ---------------------------------------------------------------------------
 
 
-def ensure_annotations(cache_dir: Path) -> Path:
-    captions_path = cache_dir / "annotations" / "captions_val2017.json"
-    if captions_path.exists():
-        return captions_path
-
-    zip_path = cache_dir / "annotations_trainval2017.zip"
-    print("Downloading COCO annotations (~240 MB)...")
-    download_file(COCO_ANNOTATIONS_URL, zip_path, desc="annotations zip")
-
-    print("Extracting annotations...")
-    with zipfile.ZipFile(zip_path, "r") as zf:
-        zf.extractall(cache_dir)
-    zip_path.unlink()
-    return captions_path
+@dataclass(frozen=True)
+class SamplePlan:
+	sample_id: str
+	split: str
+	is_attacked: bool
+	source_index: int
+	source_image_name: str
+	caption: str
 
 
-def load_captions(captions_path: Path) -> dict[int, dict]:
-    """Returns {image_id: {filename, caption}}."""
-    with open(captions_path) as f:
-        data = json.load(f)
+class QuickDrawSampler:
+	def __init__(self, npy_root: Path, seed: int) -> None:
+		self.npy_root = npy_root
+		self.rng = random.Random(seed)
+		self.npy_files = sorted(npy_root.glob("*.npy"))
 
-    id_to_filename = {img["id"]: img["file_name"] for img in data["images"]}
+		if not self.npy_files:
+			raise FileNotFoundError(f"No .npy files found in {npy_root}")
 
-    # keep only the first caption per image
-    seen = set()
-    result = {}
-    for ann in data["annotations"]:
-        iid = ann["image_id"]
-        if iid not in seen:
-            seen.add(iid)
-            result[iid] = {
-                "filename": id_to_filename[iid],
-                "caption": ann["caption"].strip(),
-            }
-    return result
+	def sample(self) -> tuple[torch.Tensor, Path, int]:
+		file_path = self.rng.choice(self.npy_files)
+		data = np.load(file_path, mmap_mode="r")
+		row_index = self.rng.randrange(data.shape[0])
 
+		raw = np.asarray(data[row_index], dtype=np.uint8)
+		if raw.ndim == 1:
+			side = 28
+			raw = raw.reshape(side, side)
 
-def download_image(filename: str, dest: Path) -> bool:
-    if dest.exists():
-        return True
-    url = f"{COCO_IMAGES_BASE_URL}/{filename}"
-    try:
-        download_file(url, dest)
-        return True
-    except Exception as e:
-        print(f"  Failed to download {filename}: {e}")
-        return False
+		tensor = torch.from_numpy(raw).float() / 255.0
+
+		return tensor, file_path, row_index
 
 
-def make_blobs_mask(rng: np.random.Generator, size: int) -> np.ndarray:
-    mask = np.zeros((size, size), dtype=np.float32)
-    n_blobs = rng.integers(1, 6)
-    for _ in range(n_blobs):
-        cx = rng.uniform(0, size)
-        cy = rng.uniform(0, size)
-        sigma = rng.uniform(3, 15)
-        amplitude = rng.uniform(0.5, 1.0)
-        xs, ys = np.meshgrid(np.arange(size), np.arange(size))
-        blob = amplitude * np.exp(-((xs - cx) ** 2 + (ys - cy) ** 2) / (2 * sigma**2))
-        mask += blob.astype(np.float32)
-    return np.clip(mask, 0, 1)
+class AdvRecognitionDataset(torch.utils.data.Dataset):
+	"""Minimal loader: returns (image PIL, caption str, is_attacked bool)."""
+
+	def __init__(self, root: str | Path, split: str | None = None) -> None:
+		self.root = Path(root)
+		metadata_path = self.root / "metadata.csv"
+		if not metadata_path.exists():
+			raise FileNotFoundError(f"Missing metadata file: {metadata_path}")
+
+		with metadata_path.open("r", encoding="utf-8", newline="") as handle:
+			self.metadata = list(csv.DictReader(handle))
+		if split is not None:
+			self.metadata = [row for row in self.metadata if row.get("split") == split]
+
+	def __len__(self) -> int:
+		return len(self.metadata)
+
+	def __getitem__(self, index: int) -> dict[str, Any]:
+		row = self.metadata[index]
+		image_path = self.root / row["image_path"]
+		image = Image.open(image_path).convert("RGB")
+		caption = row.get("caption", "")
+		is_attacked = int(row.get("is_attacked", 0)) == 1
+		return {"image": image, "caption": caption, "is_attacked": is_attacked}
 
 
-def make_shape_mask(rng: np.random.Generator, size: int) -> np.ndarray:
-    mask = np.zeros((size, size), dtype=np.float32)
-    shape = rng.choice(["circle", "rectangle"])
-    if shape == "circle":
-        cx = rng.uniform(size * 0.2, size * 0.8)
-        cy = rng.uniform(size * 0.2, size * 0.8)
-        r = rng.uniform(size * 0.1, size * 0.4)
-        xs, ys = np.meshgrid(np.arange(size), np.arange(size))
-        mask[(xs - cx) ** 2 + (ys - cy) ** 2 <= r**2] = 1.0
-    else:
-        x0 = int(rng.uniform(0, size * 0.5))
-        y0 = int(rng.uniform(0, size * 0.5))
-        x1 = int(rng.uniform(size * 0.5, size))
-        y1 = int(rng.uniform(size * 0.5, size))
-        mask[y0:y1, x0:x1] = 1.0
-    mask = gaussian_filter(mask, sigma=1.0)
-    return mask.astype(np.float32)
+def load_env() -> None:
+	load_dotenv()
+	if "HF_TOKEN" not in os.environ:
+		print("Warning: HF_TOKEN is not set in the environment.")
 
 
-def make_noise_mask(rng: np.random.Generator, size: int) -> np.ndarray:
-    noise = rng.uniform(0, 1, (size, size)).astype(np.float32)
-    sigma = rng.uniform(3, 8)
-    blurred = gaussian_filter(noise, sigma=sigma)
-    lo, hi = blurred.min(), blurred.max()
-    if hi - lo > 1e-6:
-        blurred = (blurred - lo) / (hi - lo)
-    return blurred.astype(np.float32)
+def read_coco_metadata(coco_root: Path) -> list[dict[str, str]]:
+	metadata_path = coco_root / "metadata.csv"
+	if not metadata_path.exists():
+		raise FileNotFoundError(f"Missing COCO metadata file: {metadata_path}")
+
+	with metadata_path.open("r", encoding="utf-8", newline="") as handle:
+		metadata = list(csv.DictReader(handle))
+
+	required_columns = {"image_path", "main_caption"}
+	missing_columns = required_columns.difference(metadata[0].keys() if metadata else set())
+	if missing_columns:
+		raise ValueError(f"COCO metadata is missing columns: {sorted(missing_columns)}")
+
+	return metadata
 
 
-MASK_GENERATORS = {
-    "blobs": make_blobs_mask,
-    "shape": make_shape_mask,
-    "noise": make_noise_mask,
-}
+def build_split_plan(
+	metadata: list[dict[str, str]],
+	train_size: int,
+	test_size: int,
+	attack_ratio: float,
+	seed: int,
+) -> list[SamplePlan]:
+	total_size = train_size + test_size
+	if len(metadata) < total_size:
+		raise ValueError(
+			f"Requested {total_size} samples, but only {len(metadata)} COCO images are available."
+		)
+
+	rng = random.Random(seed)
+	source_indices = list(range(len(metadata)))
+	rng.shuffle(source_indices)
+	source_indices = source_indices[:total_size]
+
+	train_indices = source_indices[:train_size]
+	test_indices = source_indices[train_size:train_size + test_size]
+
+	def make_attack_flags(size: int) -> list[bool]:
+		attacked_count = int(round(size * attack_ratio))
+		attacked_count = max(0, min(size, attacked_count))
+		flags = [True] * attacked_count + [False] * (size - attacked_count)
+		rng.shuffle(flags)
+		return flags
+
+	plans: list[SamplePlan] = []
+
+	for split_name, indices in (("train", train_indices), ("test", test_indices)):
+		attack_flags = make_attack_flags(len(indices))
+		for local_index, (source_index, is_attacked) in enumerate(zip(indices, attack_flags, strict=True)):
+			source_row = metadata[source_index]
+			sample_id = f"{split_name}_{local_index:06d}"
+			plans.append(
+				SamplePlan(
+					sample_id=sample_id,
+					split=split_name,
+					is_attacked=is_attacked,
+					source_index=source_index,
+					source_image_name=str(source_row["image_path"]),
+					caption=str(source_row["main_caption"]),
+				)
+			)
+
+	return plans
 
 
-def generate_target_mask(rng: np.random.Generator, size: int) -> tuple[np.ndarray, str]:
-    mask_type = str(rng.choice(list(MASK_GENERATORS.keys())))
-    mask = MASK_GENERATORS[mask_type](rng, size)
-    return mask, mask_type
+def ensure_output_dirs(root: Path) -> None:
+	(root / "images" / "train").mkdir(parents=True, exist_ok=True)
+	(root / "images" / "test").mkdir(parents=True, exist_ok=True)
+	(root / "targets" / "train").mkdir(parents=True, exist_ok=True)
+	(root / "targets" / "test").mkdir(parents=True, exist_ok=True)
 
 
-def save_mask(mask: np.ndarray, npy_path: Path, png_path: Path) -> None:
-    np.save(npy_path, mask)
-    img = Image.fromarray((mask * 255).astype(np.uint8), mode="L")
-    img.save(png_path)
+def save_rgb_image(image: Image.Image, path: Path) -> None:
+	path.parent.mkdir(parents=True, exist_ok=True)
+	image.save(path, quality=95)
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Prepare COCO-based adversarial attack dataset")
-    parser.add_argument("--n", type=int, default=1000, help="Number of samples")
-    parser.add_argument("--output", type=str, default="dataset/", help="Output directory")
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--cache", type=str, default=".coco_cache/", help="Cache dir for COCO annotations")
-    parser.add_argument("--workers", type=int, default=8, help="Parallel download workers")
-    args = parser.parse_args()
+def save_quickdraw_target(target: torch.Tensor, path: Path) -> None:
+	path.parent.mkdir(parents=True, exist_ok=True)
+	target_uint8 = torch.clamp(target * 255.0, 0, 255).to(torch.uint8).cpu().numpy()
+	Image.fromarray(target_uint8, mode="L").save(path)
 
-    rng = np.random.default_rng(args.seed)
-    random.seed(args.seed)
 
-    output_dir = Path(args.output)
-    images_dir = output_dir / "images"
-    targets_dir = output_dir / "targets"
-    images_dir.mkdir(parents=True, exist_ok=True)
-    targets_dir.mkdir(parents=True, exist_ok=True)
-    cache_dir = Path(args.cache)
+def build_record_row(
+	root: Path,
+	sample_id: str,
+	split: str,
+	is_attacked: bool,
+	source_image_path: Path,
+	image_path: Path,
+	caption: str,
+) -> dict[str, Any]:
+	# Minimal metadata: path relative to dataset root, caption, and attacked flag (0/1)
+	return {
+		"image_path": str(image_path.relative_to(root)),
+		"caption": caption,
+		"is_attacked": int(is_attacked),
+	}
 
-    # --- Step 1: annotations ---
-    captions_path = ensure_annotations(cache_dir)
-    print("Loading captions...")
-    all_samples = load_captions(captions_path)
 
-    # --- Step 2: sample N image ids ---
-    all_ids = list(all_samples.keys())
-    if args.n > len(all_ids):
-        raise ValueError(f"Requested {args.n} samples but COCO val has only {len(all_ids)}")
-    selected_ids = rng.choice(all_ids, size=args.n, replace=False).tolist()
+def generate_dataset_for_model(
+	model_key: str,
+	coco_root: Path,
+	quickdraw_root: Path,
+	output_root: Path,
+	seed: int,
+	train_size: int,
+	test_size: int,
+	attack_ratio: float,
+) -> Path:
+	coco_metadata = read_coco_metadata(coco_root)
+	plans = build_split_plan(coco_metadata, train_size, test_size, attack_ratio, seed)
 
-    # --- Step 3: download images ---
-    print(f"Downloading {args.n} images...")
-    download_tasks = [(all_samples[iid]["filename"], images_dir / all_samples[iid]["filename"]) for iid in selected_ids]
-    failed = []
-    with ThreadPoolExecutor(max_workers=args.workers) as pool:
-        futures = {
-            pool.submit(download_image, fname, dest): iid for iid, (fname, dest) in zip(selected_ids, download_tasks)
-        }
-        for future in tqdm(as_completed(futures), total=len(futures), desc="images"):
-            iid = futures[future]
-            if not future.result():
-                failed.append(iid)
+	dataset_root = output_root / f"{model_key}-adv-recognition-ds"
+	if dataset_root.exists():
+		print(f"Dataset root already exists: {dataset_root}")
 
-    if failed:
-        print(f"Warning: {len(failed)} images failed to download, removing from index")
-        selected_ids = [iid for iid in selected_ids if iid not in set(failed)]
+	ensure_output_dirs(dataset_root)
 
-    # --- Step 4: generate target masks ---
-    print("Generating target masks...")
-    index = []
-    for iid in tqdm(selected_ids, desc="masks"):
-        sample = all_samples[iid]
-        sample_id = f"{iid:012d}"
-        mask, mask_type = generate_target_mask(rng, TARGET_SIZE)
-        npy_path = targets_dir / f"target_{sample_id}.npy"
-        png_path = targets_dir / f"target_{sample_id}.png"
-        save_mask(mask, npy_path, png_path)
+	# write a tiny config for traceability
+	(dataset_root / "info.json").write_text(
+		json.dumps({"model_key": model_key, "seed": seed, "train_size": train_size, "test_size": test_size, "attack_ratio": attack_ratio}, indent=2),
+		encoding="utf-8",
+	)
 
-        index.append(
-            {
-                "id": sample_id,
-                "coco_image_id": iid,
-                "image_path": str(Path("images") / sample["filename"]),
-                "caption": sample["caption"],
-                "target_path": str(Path("targets") / f"target_{sample_id}.npy"),
-                "target_type": mask_type,
-            }
-        )
+	device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+	print(f"Loading model {model_key} on {device}")
+	model = build_clip_model(model_key, device=str(device), load_on_init=False)
+	model.load_model()
 
-    # --- Step 5: save index + splits ---
-    rng.shuffle(index)
+	quickdraw_sampler = QuickDrawSampler(quickdraw_root, seed=seed + 17)
+	records: list[dict[str, Any]] = []
 
-    n = len(index)
-    n_train = int(n * 0.8)
-    n_val = int(n * 0.1)
-    splits = {
-        "train": index[:n_train],
-        "val": index[n_train : n_train + n_val],
-        "test": index[n_train + n_val :],
-    }
+	for plan in tqdm(plans, desc=f"Building {model_key}"):
+		source_row = coco_metadata[plan.source_index]
+		source_image_path = coco_root / "images" / str(source_row["image_path"])
+		if not source_image_path.exists():
+			raise FileNotFoundError(f"Missing source image: {source_image_path}")
 
-    for split_name, records in splits.items():
-        for rec in records:
-            rec["split"] = split_name
+		output_image_path = dataset_root / "images" / plan.split / f"{plan.sample_id}.jpg"
+		output_target_path = dataset_root / "targets" / plan.split / f"{plan.sample_id}.png"
 
-    index_path = output_dir / "index.json"
-    with open(index_path, "w") as f:
-        json.dump(index, f, indent=2)
+		image = Image.open(source_image_path).convert("RGB")
+		image = image.resize(TARGET_SIZE, resample=Image.Resampling.LANCZOS)
+		print(image.size)
+		
+		if plan.is_attacked:
+			print(f"Attacking sample {plan.sample_id} with caption: {plan.caption}")
+			target_tensor, _, _ = quickdraw_sampler.sample()
+			print("target_tensor shape:", target_tensor.shape)
+			attacked_image, _, _, _ = model.ruin(image, plan.caption, target_tensor)
+			save_rgb_image(attacked_image.convert("RGB"), output_image_path)
+			# targets are not needed in metadata for the simplified format, but saved for trace
+			save_quickdraw_target(target_tensor, output_target_path)
+			records.append(build_record_row(dataset_root, plan.sample_id, plan.split, True, source_image_path, output_image_path, plan.caption))
+		else:
+			print(f"Saving clean sample {plan.sample_id} with caption: {plan.caption}")
+			save_rgb_image(image, output_image_path)
+			records.append(build_record_row(dataset_root, plan.sample_id, plan.split, False, source_image_path, output_image_path, plan.caption))
 
-    for split_name, records in splits.items():
-        split_path = output_dir / f"{split_name}.json"
-        with open(split_path, "w") as f:
-            json.dump(records, f, indent=2)
+		if torch.cuda.is_available():
+			torch.cuda.empty_cache()
 
-    type_counts = {}
-    for rec in index:
-        type_counts[rec["target_type"]] = type_counts.get(rec["target_type"], 0) + 1
+	model.offload_from_gpu()
+	model.unload_model()
 
-    print(f"\nDone. {len(index)} samples saved to {output_dir}/")
-    print(f"  images:  {images_dir}/")
-    print(f"  targets: {targets_dir}/  {type_counts}")
-    print(f"  index:   {index_path}")
-    print(f"  splits:  train={len(splits['train'])}  val={len(splits['val'])}  test={len(splits['test'])}")
+	# only keep minimal columns in metadata: image_path, caption, is_attacked
+	metadata_path = dataset_root / "metadata.csv"
+	with metadata_path.open("w", encoding="utf-8", newline="") as handle:
+		writer = csv.DictWriter(handle, fieldnames=["image_path", "caption", "is_attacked"]) 
+		writer.writeheader()
+		writer.writerows(records)
+
+	# print(f"Finished {model_key}: {dataset_root}")
+	# split_counts: dict[tuple[str, bool], int] = {}
+	# for row in records:
+	# 	key = (row["split"], bool(row["is_attacked"]))
+	# 	split_counts[key] = split_counts.get(key, 0) + 1
+	# print(split_counts)
+	return dataset_root
+
+
+def main() -> None:
+	load_env()
+	for model_key in SELECT_MODEL_KEYS:
+		generate_dataset_for_model(
+			model_key=model_key,
+			coco_root=COCO_ROOT,
+			quickdraw_root=QUICKDRAW_ROOT,
+			output_root=OUTPUT_ROOT,
+			seed=SEED,
+			train_size=TRAIN_SIZE,
+			test_size=TEST_SIZE,
+			attack_ratio=ATTACK_RATIO,
+		)
 
 
 if __name__ == "__main__":
-    main()
+	main()

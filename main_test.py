@@ -15,11 +15,11 @@ import numpy as np
 import cv2
 
 MODEL_KEYS = [
-    "openai-vit-b32",
+    # "openai-vit-b32",
     "openai-vit-b16",
-    "openai-vit-l14",
-    "google-siglip2-b32-256",
-    "facebook-metaclip2-b16",
+    # "openai-vit-l14",
+    # "google-siglip2-b32-256",
+    # "facebook-metaclip2-b16",
 ]
 
 
@@ -59,8 +59,8 @@ def tensor_stats(t, name="Tensor"):
 
 
 def run_forward_smoke_test() -> None:
-    image = Image.open("Images/SampleImages/dog_and_car.png").convert("RGB")
-    text = "a dog in a car waiting for traffic lights"
+    image = Image.open("DatasetUtils/data/generated_datasets/openai-vit-b16-adv-recognition-ds/images/test/test_000002.jpg").convert("RGB")
+    text = "A group of guys standing behind tables on a stage before a presentation."
 
     use_cuda = torch.cuda.is_available()
     device = "cuda:0" if use_cuda else "cpu"
@@ -73,11 +73,11 @@ def run_forward_smoke_test() -> None:
         model.load_model()
         # model.print_model_info()
 
-        for model_key_prim in MODEL_KEYS:
-            ruined_img = Image.open(f"Images/Output/ruined_{model_key_prim}.png").convert("RGB")
+        # for model_key_prim in MODEL_KEYS:
+        #     ruined_img = Image.open(f"DatasetUtils/data/generated_datasets/openai-vit-b16-adv-recognition-ds/images/test/test_000001.jpg").convert("RGB")
 
-            emap, _ = model.explain(image=ruined_img, text=text)
-            visualize(emap, ruined_img, f"Images/Output/CrossEmap/emap_expl_with_{model_key}_{model_key_prim}.png")
+        emap, _ = model.explain(image=image, text=text)
+        visualize(emap, image, f"tmp.png")
 
         # target_img = Image.open("Images/targets/smiley.gif").convert("RGBA")
         # target_tensor = 1 - torchvision.transforms.ToTensor()(target_img)[0, :, :]

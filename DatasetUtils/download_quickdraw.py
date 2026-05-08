@@ -12,7 +12,7 @@ from PIL import Image
 import time
 
 # Konfiguracja
-DEST_FOLDER = "/tmp/quick_draw_dataset"
+DEST_FOLDER = "data/quick_draw_dataset"
 UNPACKED_FOLDER = os.path.join(DEST_FOLDER, "unpacked")
 NPY_FOLDER = os.path.join(DEST_FOLDER, "npy_files")
 
@@ -75,48 +75,6 @@ def download_npy_files():
     print("Pobieranie zakończone.")
 
 
-def unpack_npy_files():
-    """Rozpakowanie plików .npy na pojedyncze obrazki 32x32."""
-    npy_files = [f for f in os.listdir(NPY_FOLDER) if f.endswith(".npy")]
-
-    print(f"\n📦 Rozpakowanie {len(npy_files)} plików .npy...")
-
-    total_images = 0
-
-    for file_idx, npy_file in enumerate(npy_files, 1):
-        class_name = npy_file[:-4]  # Usunięcie .npy
-        file_path = os.path.join(NPY_FOLDER, npy_file)
-
-        try:
-            print(f"[{file_idx}/{len(npy_files)}] Rozpakowanie: {class_name}...", end=" ", flush=True)
-
-            # Wczytanie tablicy numpy
-            data = np.load(file_path)
-            print(f"({data.shape[0]} obrazków)", end=" ", flush=True)
-
-            # Tworzenie folderu klasy
-            class_folder = os.path.join(UNPACKED_FOLDER, class_name)
-            os.makedirs(class_folder, exist_ok=True)
-
-            # Rozpakowanie każdego obrazka
-            for img_idx, image_data in enumerate(data):
-                # Normalizacja do zakresu 0-255
-                image_array = image_data.reshape(28, 28).astype(np.uint8)
-
-                # Tworzenie obrazka PIL i zapisanie
-                image = Image.fromarray(image_array, mode="L")
-
-                # Zapisanie jako PNG
-                img_path = os.path.join(class_folder, f"{img_idx:06d}.png")
-                image.save(img_path)
-
-            total_images += data.shape[0]
-            print("✓")
-
-        except Exception as e:
-            print(f"✗ (Błąd: {e})")
-
-
 def main():
     """Główna funkcja."""
     print("=" * 60)
@@ -125,7 +83,6 @@ def main():
 
     create_folders()
     download_all_simplified()
-    unpack_npy_files()
 
     print("\n" + "=" * 60)
     print("✓ Pobieranie i rozpakowanie zakończone!")

@@ -1,0 +1,1 @@
+# Kod w tym folderze raczej nie zadziała outof the box trzeba specjalisty żeby pozmieniał na takie co zadziała. Także ten... xD kiedyś może to pozmieniam jak będzie trzeba jeszcze raz wygenerować ten set.
